@@ -93,7 +93,15 @@ const startServer = async () => {
   startSubscriptionExpiryJob();
   startUsageResetJob();
 
-  // 5. Start listening.
+  // 5a. Start BullMQ workers in the same process (single-dyno free-tier deployments).
+  try {
+    require('./src/workers/index');
+    logger.info('BullMQ workers started.');
+  } catch (err) {
+    logger.warn(`Workers failed to start: ${err.message}`);
+  }
+
+  // 6. Start listening.
   server.listen(PORT, () => {
     logger.info(`Server running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
   });
