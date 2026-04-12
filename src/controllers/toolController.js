@@ -17,9 +17,11 @@ exports.runAiTool = async (req, res) => {
   const { tool } = req.params;
   const body = req.body;
 
-  // Enforce usage limits
-  const usageCheck = await usageService.canUse(req.user._id, req.user.plan);
-  if (!usageCheck.allowed) throw new ApiError(429, usageCheck.reason);
+  // Enforce usage limits (skip for guests)
+  if (req.user) {
+    const usageCheck = await usageService.canUse(req.user._id, req.user.plan);
+    if (!usageCheck.allowed) throw new ApiError(429, usageCheck.reason);
+  }
 
   let result;
 
@@ -129,8 +131,8 @@ exports.runAiTool = async (req, res) => {
       result = await aiService.generic(tool, body);
   }
 
-  // Record usage (non-blocking)
-  usageService.record(req.user._id, tool, 'ai-writing', 0).catch(() => {});
+  // Record usage (non-blocking, skip for guests)
+  if (req.user) usageService.record(req.user._id, tool, 'ai-writing', 0).catch(() => {});
 
   return successResponse(res, {
     tool,
@@ -145,8 +147,10 @@ exports.analyzeResumeFile = async (req, res) => {
   const { tool, jobDescription, resumeText: bodyText } = req.body;
   if (!tool) throw new ApiError(400, 'tool is required');
 
-  const usageCheck = await usageService.canUse(req.user._id, req.user.plan);
-  if (!usageCheck.allowed) throw new ApiError(429, usageCheck.reason);
+  if (req.user) {
+    const usageCheck = await usageService.canUse(req.user._id, req.user.plan);
+    if (!usageCheck.allowed) throw new ApiError(429, usageCheck.reason);
+  }
 
   // Extract text from uploaded file or use pasted text
   let resumeText = bodyText || '';
@@ -191,7 +195,7 @@ exports.analyzeResumeFile = async (req, res) => {
     throw new ApiError(500, 'Failed to parse AI analysis result. Please try again.');
   }
 
-  usageService.record(req.user._id, tool, 'resume', 0).catch(() => {});
+  if (req.user) usageService.record(req.user._id, tool, 'resume', 0).catch(() => {});
 
   // Spread parsedData first so the explicit `tool` field always wins,
   // preventing AI output from accidentally overwriting the tool identifier.
@@ -204,18 +208,22 @@ exports.queueTool = async (req, res) => {
   const { tool, category, inputData } = req.body;
   if (!tool) throw new ApiError(400, 'tool is required');
 
-  const usageCheck = await usageService.canUse(req.user._id, req.user.plan);
-  if (!usageCheck.allowed) throw new ApiError(429, usageCheck.reason);
+  if (req.user) {
+    const usageCheck = await usageService.canUse(req.user._id, req.user.plan);
+    if (!usageCheck.allowed) throw new ApiError(429, usageCheck.reason);
+  }
+
+  const userId = req.user ? req.user._id : null;
 
   const bullJob = await addJob(category || 'ai', tool, {
     tool,
-    userId: req.user._id.toString(),
+    userId: userId ? userId.toString() : 'guest',
     inputData: inputData || req.body,
   });
 
   const jobRecord = await Job.create({
     jobId:    bullJob.id,
-    userId:   req.user._id,
+    userId,
     tool,
     category: category || 'ai',
     status:   'pending',
@@ -230,7 +238,10 @@ exports.queueTool = async (req, res) => {
 // ─── Get job status ───────────────────────────────────────────────────────────
 
 exports.getJobStatus = async (req, res) => {
-  const job = await Job.findOne({ jobId: req.params.jobId, userId: req.user._id });
+  const query = req.user
+    ? { jobId: req.params.jobId, userId: req.user._id }
+    : { jobId: req.params.jobId };
+  const job = await Job.findOne(query);
   if (!job) throw new ApiError(404, 'Job not found');
 
   return successResponse(res, {
