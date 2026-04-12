@@ -24,31 +24,31 @@ const resumeMemUpload = multer({
 
 // Resume file analysis — memory upload, no Cloudinary storage
 router.post('/resume/analyze',
-  authenticate,
+  optionalAuth,
   apiLimiter,
   checkUsageLimit,
   (req, res, next) => resumeMemUpload(req, res, (err) => err ? next(err) : next()),
   toolController.analyzeResumeFile
 );
 
-// AI text tools — authenticated, usage-limited
+// AI text tools — guests allowed, usage-limited for logged-in users
 router.post('/ai/:tool',
-  authenticate,
+  optionalAuth,
   apiLimiter,
   checkUsageLimit,
   toolController.runAiTool
 );
 
-// Queue-based tools
+// Queue-based tools — guests allowed
 router.post('/queue',
-  authenticate,
+  optionalAuth,
   apiLimiter,
   checkUsageLimit,
   toolController.queueTool
 );
 
-// Job status polling
-router.get('/jobs/:jobId/status', authenticate, toolController.getJobStatus);
+// Job status polling — guests can poll their own jobs
+router.get('/jobs/:jobId/status', optionalAuth, toolController.getJobStatus);
 
 // Job management
 router.get('/jobs',               authenticate, jobController.listJobs);

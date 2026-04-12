@@ -42,6 +42,12 @@ const checkPlan = (minPlan) => {
 // Sets req.usageOk = true when the request is allowed through.
 const checkUsageLimit = async (req, res, next) => {
   try {
+    // Guests (no login) — allow through without usage tracking
+    if (!req.user) {
+      req.usageOk = true;
+      return next();
+    }
+
     const userId = req.user._id;
     const userPlan = req.user.plan || 'free';
 
