@@ -144,7 +144,7 @@ async function generateWithOpenAI(systemPrompt, userPrompt, options = {}) {
 async function generateWithGemini(systemPrompt, userPrompt, options = {}) {
   const genAI  = getGemini();
   const model  = genAI.getGenerativeModel({
-    model: options.model || 'gemini-2.0-flash',
+    model: options.model || 'gemini-1.5-flash-latest',
     generationConfig: {
       temperature: options.temperature ?? 0.7,
       maxOutputTokens: options.maxTokens || 1500,
