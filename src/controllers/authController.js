@@ -367,7 +367,7 @@ exports.facebookAuth = (req, res) => {
     scope:         'email,public_profile',
     response_type: 'code',
   });
-  res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
+  res.redirect(`https://www.facebook.com/v21.0/dialog/oauth?${params}`);
 };
 
 exports.facebookCallback = async (req, res) => {
@@ -376,7 +376,7 @@ exports.facebookCallback = async (req, res) => {
     if (!code) return res.redirect(`${process.env.FRONTEND_URL}/auth/login?error=oauth_cancelled`);
 
     const tokenRes = await fetch(
-      `https://graph.facebook.com/v19.0/oauth/access_token?${new URLSearchParams({
+      `https://graph.facebook.com/v21.0/oauth/access_token?${new URLSearchParams({
         client_id:     process.env.FACEBOOK_APP_ID,
         client_secret: process.env.FACEBOOK_APP_SECRET,
         redirect_uri:  `${process.env.BACKEND_URL}/api/v1/auth/facebook/callback`,
@@ -390,7 +390,10 @@ exports.facebookCallback = async (req, res) => {
       `https://graph.facebook.com/me?fields=name,email,picture&access_token=${tokenData.access_token}`
     );
     const fbUser = await userRes.json();
-    if (!fbUser.email) throw new Error('No email from Facebook');
+    // Facebook may not return email if user hasn't verified it
+    if (!fbUser.email) {
+      return res.redirect(`${process.env.FRONTEND_URL}/auth/login?error=facebook_no_email`);
+    }
 
     const accessToken = await handleOAuthUser(fbUser.email, fbUser.name, fbUser.picture?.data?.url, res);
     res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${accessToken}`);
