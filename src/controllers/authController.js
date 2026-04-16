@@ -282,3 +282,120 @@ exports.deleteAccount = async (req, res) => {
   res.clearCookie('refreshToken', { httpOnly: true, secure: process.env.NODE_ENV === 'production' });
   return successResponse(res, null, 'Account deleted successfully');
 };
+
+// ─── OAuth helpers ────────────────────────────────────────────────────────────
+
+async function handleOAuthUser(email, name, avatar, res) {
+  let user = await User.findOne({ email: email.toLowerCase() });
+  if (!user) {
+    user = await User.create({
+      name: name || email.split('@')[0],
+      email: email.toLowerCase(),
+      password: crypto.randomBytes(32).toString('hex'),
+      avatar,
+      isEmailVerified: true,
+    });
+  }
+  const accessToken  = user.generateAccessToken();
+  const refreshToken = user.generateRefreshToken();
+  user.refreshToken  = refreshToken;
+  await user.save({ validateBeforeSave: false });
+
+  res.cookie('refreshToken', refreshToken, REFRESH_COOKIE_OPTIONS);
+  return accessToken;
+}
+
+// ─── Google OAuth ─────────────────────────────────────────────────────────────
+
+exports.googleAuth = (req, res) => {
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    return res.redirect(`${process.env.FRONTEND_URL}/auth/login?error=google_not_configured`);
+  }
+  const params = new URLSearchParams({
+    client_id:     process.env.GOOGLE_CLIENT_ID,
+    redirect_uri:  `${process.env.BACKEND_URL}/api/v1/auth/google/callback`,
+    response_type: 'code',
+    scope:         'openid email profile',
+    access_type:   'offline',
+    prompt:        'select_account',
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
+};
+
+exports.googleCallback = async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) return res.redirect(`${process.env.FRONTEND_URL}/auth/login?error=oauth_cancelled`);
+
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    new URLSearchParams({
+        code,
+        client_id:     process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri:  `${process.env.BACKEND_URL}/api/v1/auth/google/callback`,
+        grant_type:    'authorization_code',
+      }),
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) throw new Error('No access token from Google');
+
+    const userRes  = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const googleUser = await userRes.json();
+    if (!googleUser.email) throw new Error('No email from Google');
+
+    const accessToken = await handleOAuthUser(googleUser.email, googleUser.name, googleUser.picture, res);
+    res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${accessToken}`);
+  } catch (err) {
+    logger.error('Google OAuth error', { error: err.message });
+    res.redirect(`${process.env.FRONTEND_URL}/auth/login?error=oauth_failed`);
+  }
+};
+
+// ─── Facebook OAuth ───────────────────────────────────────────────────────────
+
+exports.facebookAuth = (req, res) => {
+  if (!process.env.FACEBOOK_APP_ID) {
+    return res.redirect(`${process.env.FRONTEND_URL}/auth/login?error=facebook_not_configured`);
+  }
+  const params = new URLSearchParams({
+    client_id:     process.env.FACEBOOK_APP_ID,
+    redirect_uri:  `${process.env.BACKEND_URL}/api/v1/auth/facebook/callback`,
+    scope:         'email,public_profile',
+    response_type: 'code',
+  });
+  res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
+};
+
+exports.facebookCallback = async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) return res.redirect(`${process.env.FRONTEND_URL}/auth/login?error=oauth_cancelled`);
+
+    const tokenRes = await fetch(
+      `https://graph.facebook.com/v19.0/oauth/access_token?${new URLSearchParams({
+        client_id:     process.env.FACEBOOK_APP_ID,
+        client_secret: process.env.FACEBOOK_APP_SECRET,
+        redirect_uri:  `${process.env.BACKEND_URL}/api/v1/auth/facebook/callback`,
+        code,
+      })}`
+    );
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) throw new Error('No access token from Facebook');
+
+    const userRes = await fetch(
+      `https://graph.facebook.com/me?fields=name,email,picture&access_token=${tokenData.access_token}`
+    );
+    const fbUser = await userRes.json();
+    if (!fbUser.email) throw new Error('No email from Facebook');
+
+    const accessToken = await handleOAuthUser(fbUser.email, fbUser.name, fbUser.picture?.data?.url, res);
+    res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${accessToken}`);
+  } catch (err) {
+    logger.error('Facebook OAuth error', { error: err.message });
+    res.redirect(`${process.env.FRONTEND_URL}/auth/login?error=oauth_failed`);
+  }
+};

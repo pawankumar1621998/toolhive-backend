@@ -8,6 +8,12 @@ const { authLimiter } = require('../middleware/rateLimiter');
 
 const router = Router();
 
+// OAuth routes
+router.get('/google',            authController.googleAuth);
+router.get('/google/callback',   authController.googleCallback);
+router.get('/facebook',          authController.facebookAuth);
+router.get('/facebook/callback', authController.facebookCallback);
+
 // Public routes
 router.post('/signup',          authLimiter, validate(schemas.signup),          authController.signup);
 router.post('/login',           authLimiter, validate(schemas.login),           authController.login);
