@@ -143,17 +143,34 @@ async function generateWithOpenAI(systemPrompt, userPrompt, options = {}) {
 
 async function generateWithGemini(systemPrompt, userPrompt, options = {}) {
   const genAI  = getGemini();
-  const model  = genAI.getGenerativeModel({
-    model: options.model || 'gemini-1.5-flash-latest',
-    generationConfig: {
-      temperature: options.temperature ?? 0.7,
-      maxOutputTokens: options.maxTokens || 1500,
-    },
-    systemInstruction: systemPrompt,
-  });
+  // Try models in order — newer ones may not be on free tier
+  const modelsToTry = options.model
+    ? [options.model]
+    : ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.0-pro'];
 
-  const result = await model.generateContent(userPrompt);
-  return result.response.text().trim();
+  const combinedPrompt = `${systemPrompt}\n\n${userPrompt}`;
+
+  for (const modelName of modelsToTry) {
+    try {
+      const model = genAI.getGenerativeModel({
+        model: modelName,
+        generationConfig: {
+          temperature: options.temperature ?? 0.7,
+          maxOutputTokens: options.maxTokens || 1500,
+        },
+      });
+      const result = await model.generateContent(combinedPrompt);
+      return result.response.text().trim();
+    } catch (err) {
+      const msg = err.message || '';
+      // Only try next model if this one is not found / not supported
+      if (msg.includes('not found') || msg.includes('not supported') || msg.includes('404')) {
+        continue;
+      }
+      throw err; // quota/auth errors — propagate
+    }
+  }
+  throw new Error('No Gemini model available');
 }
 
 // ─── Tool-specific helpers ────────────────────────────────────────────────────
