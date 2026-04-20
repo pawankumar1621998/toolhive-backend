@@ -1,9 +1,9 @@
 'use strict';
 
 /**
- * AI Service — wraps DeepSeek (primary), Groq (fallback), Gemini, and OpenAI.
+ * AI Service — wraps DeepSeek, Groq, Gemini, Mistral, OpenRouter, and OpenAI.
  *
- * Provider priority: DeepSeek → Groq → Gemini → OpenAI
+ * Provider priority: DeepSeek → Groq → Gemini → Mistral → OpenRouter → OpenAI
  */
 
 const Groq = require('groq-sdk');
@@ -13,10 +13,12 @@ const logger = require('../utils/logger');
 
 // ─── Client initialisation ───────────────────────────────────────────────────
 
-let groqClient    = null;
-let openaiClient  = null;
-let geminiClient  = null;
-let deepseekClient = null;
+let groqClient      = null;
+let openaiClient    = null;
+let geminiClient    = null;
+let deepseekClient  = null;
+let mistralClient   = null;
+let openrouterClient = null;
 
 function getDeepSeek() {
   if (!deepseekClient) {
@@ -53,6 +55,29 @@ function getGemini() {
   return geminiClient;
 }
 
+function getMistral() {
+  if (!mistralClient) {
+    if (!process.env.MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY is not set');
+    mistralClient = new OpenAI({
+      apiKey:  process.env.MISTRAL_API_KEY,
+      baseURL: 'https://api.mistral.ai/v1',
+    });
+  }
+  return mistralClient;
+}
+
+function getOpenRouter() {
+  if (!openrouterClient) {
+    if (!process.env.OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY is not set');
+    openrouterClient = new OpenAI({
+      apiKey:       process.env.OPENROUTER_API_KEY,
+      baseURL:      'https://openrouter.ai/api/v1',
+      defaultHeaders: { 'HTTP-Referer': 'https://toolhive.app' },
+    });
+  }
+  return openrouterClient;
+}
+
 // ─── Core text generation — provider waterfall ───────────────────────────────
 
 /**
@@ -86,11 +111,29 @@ async function generateText(systemPrompt, userPrompt, options = {}) {
     try {
       return await generateWithGemini(systemPrompt, userPrompt, options);
     } catch (err) {
-      logger.warn('Gemini failed, falling back to OpenAI', { error: err.message });
+      logger.warn('Gemini failed, falling back to Mistral', { error: err.message });
     }
   }
 
-  // 4. OpenAI (last resort)
+  // 4. Mistral AI (free tier fallback)
+  if (!options.provider && process.env.MISTRAL_API_KEY) {
+    try {
+      return await generateWithMistral(systemPrompt, userPrompt, options);
+    } catch (err) {
+      logger.warn('Mistral failed, falling back to OpenRouter', { error: err.message });
+    }
+  }
+
+  // 5. OpenRouter — free Llama models (fallback)
+  if (!options.provider && process.env.OPENROUTER_API_KEY) {
+    try {
+      return await generateWithOpenRouter(systemPrompt, userPrompt, options);
+    } catch (err) {
+      logger.warn('OpenRouter failed, falling back to OpenAI', { error: err.message });
+    }
+  }
+
+  // 6. OpenAI (last resort)
   try {
     return await generateWithOpenAI(systemPrompt, userPrompt, options);
   } catch (err) {
@@ -171,6 +214,34 @@ async function generateWithGemini(systemPrompt, userPrompt, options = {}) {
     }
   }
   throw new Error('No Gemini model available');
+}
+
+async function generateWithMistral(systemPrompt, userPrompt, options = {}) {
+  const client = getMistral();
+  const response = await client.chat.completions.create({
+    model:       options.model || 'mistral-small-latest',
+    temperature: options.temperature ?? 0.7,
+    max_tokens:  options.maxTokens || 1500,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userPrompt },
+    ],
+  });
+  return response.choices[0].message.content.trim();
+}
+
+async function generateWithOpenRouter(systemPrompt, userPrompt, options = {}) {
+  const client = getOpenRouter();
+  const response = await client.chat.completions.create({
+    model:       options.model || 'meta-llama/llama-3.1-8b-instruct:free',
+    temperature: options.temperature ?? 0.7,
+    max_tokens:  options.maxTokens || 1500,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userPrompt },
+    ],
+  });
+  return response.choices[0].message.content.trim();
 }
 
 // ─── Tool-specific helpers ────────────────────────────────────────────────────
