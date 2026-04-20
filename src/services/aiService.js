@@ -78,16 +78,37 @@ function getOpenRouter() {
   return openrouterClient;
 }
 
+// ─── Language instruction helper ─────────────────────────────────────────────
+
+function getLangInstruction(language) {
+  if (!language || language === 'English') return '';
+  const map = {
+    Hindi:      'IMPORTANT: Respond entirely in Hindi (Devanagari script). Write all content in हिंदी.',
+    Hinglish:   'IMPORTANT: Respond in Hinglish — Hindi words written in Roman/English script, casual conversational style (like: "Yeh bahut helpful hai, aap iska use kar sakte hain"). Sound natural like WhatsApp messages in India.',
+    Spanish:    'IMPORTANT: Respond entirely in Spanish.',
+    French:     'IMPORTANT: Respond entirely in French.',
+    German:     'IMPORTANT: Respond entirely in German.',
+    Arabic:     'IMPORTANT: Respond entirely in Arabic.',
+    Portuguese: 'IMPORTANT: Respond entirely in Portuguese.',
+    Bengali:    'IMPORTANT: Respond entirely in Bengali.',
+    Urdu:       'IMPORTANT: Respond entirely in Urdu (Nastaliq script).',
+  };
+  return map[language] ? `\n\n${map[language]}` : '';
+}
+
 // ─── Core text generation — provider waterfall ───────────────────────────────
 
 /**
- * Generate text using DeepSeek (primary) → Groq → Gemini → OpenAI.
+ * Generate text using DeepSeek → Groq → Gemini → Mistral → OpenRouter → OpenAI.
  *
  * @param {string} systemPrompt
  * @param {string} userPrompt
- * @param {object} [options] — { provider, model, temperature, maxTokens }
+ * @param {object} [options] — { provider, model, temperature, maxTokens, language }
  */
 async function generateText(systemPrompt, userPrompt, options = {}) {
+  // Append language instruction to system prompt if requested
+  const langNote = getLangInstruction(options.language);
+  if (langNote) systemPrompt = systemPrompt + langNote;
   // 1. DeepSeek-V3 (primary — best for writing tasks)
   if (!options.provider && process.env.DEEPSEEK_API_KEY) {
     try {
@@ -455,7 +476,7 @@ Requirements:
 
   /** Generic tool handler — fallback for any tool */
   generic: (toolName, input, options = {}) => generateText(
-    `You are an AI assistant for the ${toolName} tool. Provide helpful, accurate output.`,
+    `You are a helpful AI assistant. Provide clear, high-quality output.`,
     typeof input === 'string' ? input : JSON.stringify(input),
     options
   ),
