@@ -124,6 +124,15 @@ exports.getVideoInfo = async (req, res) => {
 };
 
 /**
+ * GET /video/download?url=...&quality=... — same as POST but via query params
+ * so the browser can download it as a direct link (no CORS, no POST form needed).
+ */
+exports.downloadVideoGet = (req, res) => {
+  req.body = { url: req.query.url, quality: req.query.quality || '720p' };
+  return exports.downloadVideo(req, res);
+};
+
+/**
  * Download a video and stream it back.
  * yt-dlp writes to a temp file (required for format merging via ffmpeg),
  * then we stream the file to the client and clean up.

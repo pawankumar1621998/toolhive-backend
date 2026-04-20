@@ -35,6 +35,16 @@ router.post('/info',
 );
 
 /**
+ * GET /api/v1/video/download?url=...&quality=...
+ * Browser-friendly direct download link (used as <a href> target).
+ */
+router.get('/download',
+  optionalAuth,
+  apiLimiter,
+  videoController.downloadVideoGet
+);
+
+/**
  * POST /api/v1/video/download
  * Download video and stream back — works for guests and logged-in users.
  */
