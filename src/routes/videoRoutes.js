@@ -19,8 +19,10 @@ const videoProcessUpload = multer({
   }),
   limits: { fileSize: 300 * 1024 * 1024 }, // 300 MB per file
   fileFilter: (req, file, cb) => {
-    const allowed = ['video/mp4', 'video/quicktime', 'video/avi', 'video/x-msvideo', 'video/webm', 'video/x-matroska', 'video/mpeg', 'video/3gpp'];
-    allowed.includes(file.mimetype) ? cb(null, true) : cb(new Error('Only video files are supported.'));
+    // Accept any video/* MIME type plus common variants browsers mis-report
+    const isVideo = file.mimetype.startsWith('video/') ||
+      ['application/mp4', 'application/x-matroska', 'application/octet-stream'].includes(file.mimetype);
+    isVideo ? cb(null, true) : cb(new Error('Only video files are supported.'));
   },
 });
 

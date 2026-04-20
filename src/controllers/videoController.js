@@ -124,12 +124,55 @@ exports.getVideoInfo = async (req, res) => {
 };
 
 /**
- * GET /video/download?url=...&quality=... — same as POST but via query params
- * so the browser can download it as a direct link (no CORS, no POST form needed).
+ * GET /video/download?url=...&quality=...
+ * Fast path: uses yt-dlp --get-url to extract the direct CDN URL in ~10s,
+ * then 302-redirects the browser to it. Browser downloads directly from CDN.
+ * Falls back to full streaming if --get-url fails.
  */
-exports.downloadVideoGet = (req, res) => {
-  req.body = { url: req.query.url, quality: req.query.quality || '720p' };
-  return exports.downloadVideo(req, res);
+const SIMPLE_FORMAT = {
+  '4k':    'best[height<=2160][ext=mp4]/best[height<=2160]',
+  '1080p': 'best[height<=1080][ext=mp4]/best[height<=1080]',
+  '720p':  'best[height<=720][ext=mp4]/best[height<=720]',
+  '480p':  'best[height<=480][ext=mp4]/best[height<=480]',
+  '360p':  'best[height<=360][ext=mp4]/worst',
+  'mp3':   'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',
+  'webm':  'best[height<=1080][ext=webm]/best[ext=webm]',
+};
+
+exports.downloadVideoGet = async (req, res) => {
+  const { url, quality = '720p' } = req.query;
+  if (!url || typeof url !== 'string' || !url.startsWith('http')) {
+    return res.status(400).json({ success: false, message: 'A valid video URL is required.' });
+  }
+
+  logger.info('Video download GET (fast redirect mode)', { url, quality });
+
+  const format = SIMPLE_FORMAT[quality] || SIMPLE_FORMAT['720p'];
+
+  try {
+    // --get-url prints the direct CDN URL without downloading (~5-15s)
+    const output = await ytDlp(url, {
+      getUrl:              true,
+      format,
+      noWarnings:          true,
+      noCallHome:          true,
+      noCheckCertificates: true,
+      noPlaylist:          true,
+      socketTimeout:       30,
+      extractorArgs:       'youtube:player_client=android,web',
+    });
+
+    const directUrl = String(output).trim().split('\n')[0].trim();
+    if (directUrl && directUrl.startsWith('http')) {
+      logger.info('Redirecting to direct URL', { url: directUrl.slice(0, 100) });
+      return res.redirect(302, directUrl);
+    }
+    throw new Error('Empty URL from --get-url');
+  } catch (err) {
+    logger.warn('get-url failed, falling back to streaming', { error: err.message });
+    req.body = { url, quality };
+    return exports.downloadVideo(req, res);
+  }
 };
 
 /**
@@ -360,7 +403,17 @@ exports.processVideo = async (req, res) => {
         const lines = inputPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
         fs.writeFileSync(concatFile, lines);
         try {
-          await runFFmpeg(['-f', 'concat', '-safe', '0', '-i', concatFile, '-c', 'copy', '-y', outputPath]);
+          // Try fast stream copy first; if codecs differ, re-encode for compatibility
+          try {
+            await runFFmpeg(['-f', 'concat', '-safe', '0', '-i', concatFile, '-c', 'copy', '-y', outputPath]);
+          } catch {
+            await runFFmpeg([
+              '-f', 'concat', '-safe', '0', '-i', concatFile,
+              '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+              '-c:a', 'aac', '-b:a', '128k',
+              '-y', outputPath,
+            ]);
+          }
         } finally {
           fs.unlink(concatFile, () => {});
         }
