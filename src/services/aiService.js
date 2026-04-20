@@ -125,7 +125,7 @@ async function generateText(systemPrompt, userPrompt, options = {}) {
   // 1. Groq / Llama-3.3-70B — fastest, generous free tier
   if (!options.provider && process.env.GROQ_API_KEY) {
     try {
-      return await withTimeout(generateWithGroq(systemPrompt, userPrompt, options), 10_000, 'Groq');
+      return await withTimeout(generateWithGroq(systemPrompt, userPrompt, options), 25_000, 'Groq');
     } catch (err) {
       logger.warn('Groq failed, falling back to Gemini', { error: err.message });
     }
@@ -134,7 +134,7 @@ async function generateText(systemPrompt, userPrompt, options = {}) {
   // 2. Gemini Flash — free tier
   if (!options.provider && process.env.GEMINI_API_KEY) {
     try {
-      return await withTimeout(generateWithGemini(systemPrompt, userPrompt, options), 10_000, 'Gemini');
+      return await withTimeout(generateWithGemini(systemPrompt, userPrompt, options), 25_000, 'Gemini');
     } catch (err) {
       logger.warn('Gemini failed, falling back to Mistral', { error: err.message });
     }
@@ -143,7 +143,7 @@ async function generateText(systemPrompt, userPrompt, options = {}) {
   // 3. Mistral AI — free tier fallback
   if (!options.provider && process.env.MISTRAL_API_KEY) {
     try {
-      return await withTimeout(generateWithMistral(systemPrompt, userPrompt, options), 10_000, 'Mistral');
+      return await withTimeout(generateWithMistral(systemPrompt, userPrompt, options), 25_000, 'Mistral');
     } catch (err) {
       logger.warn('Mistral failed, falling back to OpenRouter', { error: err.message });
     }
@@ -152,7 +152,7 @@ async function generateText(systemPrompt, userPrompt, options = {}) {
   // 4. OpenRouter — free Llama models
   if (!options.provider && process.env.OPENROUTER_API_KEY) {
     try {
-      return await withTimeout(generateWithOpenRouter(systemPrompt, userPrompt, options), 10_000, 'OpenRouter');
+      return await withTimeout(generateWithOpenRouter(systemPrompt, userPrompt, options), 25_000, 'OpenRouter');
     } catch (err) {
       logger.warn('OpenRouter failed, falling back to DeepSeek', { error: err.message });
     }
@@ -161,7 +161,7 @@ async function generateText(systemPrompt, userPrompt, options = {}) {
   // 5. DeepSeek (last free resort — balance may be zero)
   if (!options.provider && process.env.DEEPSEEK_API_KEY) {
     try {
-      return await withTimeout(generateWithDeepSeek(systemPrompt, userPrompt, options), 10_000, 'DeepSeek');
+      return await withTimeout(generateWithDeepSeek(systemPrompt, userPrompt, options), 25_000, 'DeepSeek');
     } catch (err) {
       logger.warn('DeepSeek failed, falling back to OpenAI', { error: err.message });
     }
