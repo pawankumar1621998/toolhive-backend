@@ -25,10 +25,25 @@ const { REDIS_URL } = require('./index');
 const redisClient = new Redis(REDIS_URL, {
   lazyConnect: true,
   maxRetriesPerRequest: null, // required by BullMQ
-  enableReadyCheck: false,    // must be false for Upstash
+  enableOfflineQueue: false,  // reject commands immediately when disconnected
   retryStrategy(times) {
+    // If we hit a rate limit or quota error, stop retrying immediately.
+    if (redisClient._lastError) {
+      const msg = redisClient._lastError;
+      if (
+        msg.includes('max requests limit exceeded') ||
+        msg.includes('ERR max')
+      ) {
+        logger.error('Redis quota exceeded — disabling retries.');
+        return null; // null = stop retrying
+      }
+    }
+    if (times > 10) {
+      logger.error('Redis max retries reached — giving up.');
+      return null;
+    }
     // Exponential back-off capped at 10 seconds.
-    const delay = Math.min(times * 200, 10000);
+    const delay = Math.min(times * 500, 10000);
     logger.warn(`Redis retry attempt #${times}. Retrying in ${delay}ms…`);
     return delay;
   },
@@ -45,6 +60,8 @@ redisClient.on('ready', () => {
 });
 
 redisClient.on('error', (err) => {
+  // Store last error message for retryStrategy to check.
+  redisClient._lastError = err.message;
   logger.error(`Redis client error: ${err.message}`);
 });
 

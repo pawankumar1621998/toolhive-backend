@@ -47,6 +47,8 @@ app.use(
 
 const allowedOrigins = [
   FRONTEND_URL,
+  'http://localhost:3000',
+  'http://localhost:3001',
   // Add staging / preview URLs here if needed.
 ];
 

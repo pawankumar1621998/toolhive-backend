@@ -31,15 +31,33 @@ const { startUsageResetJob }         = require('./src/cron/usageReset');
 
 /**
  * Catch Promise rejections that were never handled with .catch().
- * Log the reason and exit – running with an uncaught rejection is unsafe.
+ * Redis / BullMQ transient errors (rate limits, timeouts) are logged but do
+ * NOT crash the process — everything else exits with code 1.
  */
 process.on('unhandledRejection', (reason, promise) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+
+  // Non-fatal: Redis limit exceeded or connection errors.
+  // BullMQ sometimes emits these as unhandled rejections rather than
+  // queue 'error' events. Let the app keep running with queues degraded.
+  const isRedisError =
+    msg.includes('max requests limit exceeded') ||
+    msg.includes('ECONNREFUSED') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('Command timed out') ||
+    msg.includes('Socket closed unexpectedly');
+
+  if (isRedisError) {
+    logger.warn('Redis unhandled rejection (non-fatal, queues degraded):', msg);
+    return; // Do NOT exit
+  }
+
   logger.error('Unhandled Promise Rejection', {
-    reason: reason instanceof Error ? reason.message : reason,
+    reason: msg,
     stack: reason instanceof Error ? reason.stack : undefined,
     promise,
   });
-  // Give the logger time to flush, then exit with failure code.
   process.exit(1);
 });
 
