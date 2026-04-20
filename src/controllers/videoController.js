@@ -5,6 +5,8 @@
  *
  * POST /video/info     — fetch title, thumbnail, duration, views from any URL
  * POST /video/download — download the video and stream it back to the client
+ * POST /video/process  — FFmpeg-based processing: compress, trim, merge, convert,
+ *                        to-mp3, video-to-gif, speed, mute
  *
  * Uses yt-dlp-exec (auto-downloads yt-dlp binary) + ffmpeg-static (no system ffmpeg needed).
  */
@@ -13,6 +15,7 @@ const path     = require('path');
 const fs       = require('fs');
 const os       = require('os');
 const { randomUUID } = require('crypto');
+const { spawn } = require('child_process');
 const ytDlp    = require('yt-dlp-exec');
 const ffmpegPath = require('ffmpeg-static');
 const logger   = require('../utils/logger');
@@ -53,6 +56,30 @@ const QUALITY_FORMAT = {
 // ─── Controllers ──────────────────────────────────────────────────────────────
 
 /**
+ * Extract a clean, user-facing error message from a yt-dlp exception.
+ * yt-dlp-exec rejects with an error whose message contains the stderr output.
+ */
+function ytDlpErrorMessage(err) {
+  const raw = err.message || '';
+  if (raw.includes('Sign in to confirm'))         return 'YouTube requires sign-in for this video. Try a different video or format.';
+  if (raw.includes('age') && raw.includes('18'))  return 'This video is age-restricted and cannot be downloaded.';
+  if (raw.includes('Video unavailable'))           return 'This video is unavailable or has been removed.';
+  if (raw.includes('requires payment'))            return 'This video requires purchase and cannot be downloaded.';
+  if (raw.includes('Private video'))               return 'This is a private video and cannot be downloaded.';
+  if (raw.includes('429'))                         return 'Too many requests to the platform. Please wait a minute and try again.';
+  if (raw.includes('403'))                         return 'Access denied by the platform. The video may be region-locked.';
+  if (raw.includes('not supported') || raw.includes('No video formats found'))
+    return 'This URL or platform is not supported.';
+  if (raw.includes('timed out') || raw.includes('timeout'))
+    return 'Request timed out. Please try again.';
+  // Return last meaningful line from stderr
+  const lines = raw.split('\n').map((l) => l.trim()).filter(Boolean);
+  const errorLine = lines.find((l) => l.startsWith('ERROR:'));
+  if (errorLine) return errorLine.replace(/^ERROR:\s*\[[^\]]+\]\s*[^:]+:\s*/, '');
+  return 'Could not fetch video info. The URL may be invalid or the platform may be temporarily unavailable.';
+}
+
+/**
  * GET video metadata — title, thumbnail, duration, author, views.
  * No file download; fast lookup via yt-dlp --dump-single-json.
  */
@@ -64,25 +91,36 @@ exports.getVideoInfo = async (req, res) => {
 
   logger.info('Video info request', { url });
 
-  const info = await ytDlp(url, {
-    dumpSingleJson:    true,
-    noWarnings:        true,
-    noCallHome:        true,
-    noCheckCertificates: true,
-    ffmpegLocation:    ffmpegPath,
-  });
+  try {
+    const info = await ytDlp(url, {
+      dumpSingleJson:      true,
+      noWarnings:          true,
+      noCallHome:          true,
+      noCheckCertificates: true,
+      noPlaylist:          true,
+      socketTimeout:       30,
+      retries:             2,
+      // Use Android + web clients — bypasses YouTube bot detection on server IPs
+      extractorArgs:       'youtube:player_client=android,web',
+      ffmpegLocation:      ffmpegPath,
+    });
 
-  return res.json({
-    success: true,
-    data: {
-      title:     info.title     || 'Unknown Title',
-      author:    info.uploader  || info.channel || info.creator || 'Unknown',
-      thumbnail: info.thumbnail || null,
-      duration:  formatDuration(info.duration),
-      views:     formatViews(info.view_count),
-      platform:  info.extractor_key || 'Unknown',
-    },
-  });
+    return res.json({
+      success: true,
+      data: {
+        title:     info.title     || 'Unknown Title',
+        author:    info.uploader  || info.channel || info.creator || 'Unknown',
+        thumbnail: info.thumbnail || null,
+        duration:  formatDuration(info.duration),
+        views:     formatViews(info.view_count),
+        platform:  info.extractor_key || 'Unknown',
+      },
+    });
+  } catch (err) {
+    logger.error('Video info error', { url, error: err.message });
+    const message = ytDlpErrorMessage(err);
+    return res.status(400).json({ success: false, message });
+  }
 };
 
 /**
@@ -106,13 +144,16 @@ exports.downloadVideo = async (req, res) => {
 
   try {
     const ytDlpOptions = {
-      output:             tmpFile,
+      output:              tmpFile,
       format,
-      noWarnings:         true,
-      noCallHome:         true,
+      noWarnings:          true,
+      noCallHome:          true,
       noCheckCertificates: true,
-      noPlaylist:         true,
-      ffmpegLocation:     ffmpegPath,
+      noPlaylist:          true,
+      socketTimeout:       60,
+      retries:             2,
+      extractorArgs:       'youtube:player_client=android,web',
+      ffmpegLocation:      ffmpegPath,
     };
 
     // For MP3, extract and convert audio
@@ -163,6 +204,193 @@ exports.downloadVideo = async (req, res) => {
   } catch (err) {
     fs.unlink(tmpFile, () => {});
     logger.error('Video download error', { url, error: err.message });
-    throw err;
+    if (!res.headersSent) {
+      return res.status(400).json({ success: false, message: ytDlpErrorMessage(err) });
+    }
+  }
+};
+
+// ─── FFmpeg process helper ─────────────────────────────────────────────────────
+
+function runFFmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, args);
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => {
+      if (code === 0) resolve(stderr);
+      else reject(new Error(`FFmpeg exited ${code}: ${stderr.slice(-600)}`));
+    });
+    proc.on('error', reject);
+  });
+}
+
+function videoMimeType(ext) {
+  const map = { mp4: 'video/mp4', webm: 'video/webm', avi: 'video/x-msvideo', mov: 'video/quicktime', mkv: 'video/x-matroska', gif: 'image/gif', mp3: 'audio/mpeg' };
+  return map[ext] || 'video/mp4';
+}
+
+// ─── Video process controller ─────────────────────────────────────────────────
+
+/**
+ * POST /video/process
+ * Body (multipart/form-data): toolSlug, options (JSON), file (single) or files[] (merge)
+ */
+exports.processVideo = async (req, res) => {
+  const { toolSlug, options: optionsStr } = req.body;
+  const options = JSON.parse(optionsStr || '{}');
+
+  const fileList = req.files && req.files.length ? req.files : req.file ? [req.file] : [];
+  if (!fileList.length) {
+    return res.status(400).json({ success: false, message: 'No video file uploaded.' });
+  }
+
+  const id = randomUUID();
+  const tmpDir = os.tmpdir();
+
+  // Input paths (multer disk storage writes directly, use req.file.path)
+  const inputPaths = fileList.map((f) => f.path);
+  let outputPath = null;
+  let outputName = 'output.mp4';
+  let outputExt  = 'mp4';
+
+  logger.info('Video process request', { toolSlug, options });
+
+  try {
+    switch (toolSlug) {
+
+      case 'compress': {
+        outputExt  = 'mp4';
+        outputPath = path.join(tmpDir, `th_out_${id}.mp4`);
+        outputName = 'compressed_video.mp4';
+        const crf  = options.quality === 'high' ? '20' : options.quality === 'low' ? '32' : '26';
+        await runFFmpeg(['-i', inputPaths[0], '-vcodec', 'libx264', '-crf', crf, '-preset', 'fast', '-movflags', '+faststart', '-y', outputPath]);
+        break;
+      }
+
+      case 'trim': {
+        outputExt  = 'mp4';
+        outputPath = path.join(tmpDir, `th_out_${id}.mp4`);
+        outputName = 'trimmed_video.mp4';
+        const start = options.startTime || '00:00:00';
+        const end   = options.endTime   || '00:01:00';
+        await runFFmpeg(['-i', inputPaths[0], '-ss', start, '-to', end, '-c', 'copy', '-y', outputPath]);
+        break;
+      }
+
+      case 'convert': {
+        const fmt  = (options.format || 'mp4').toLowerCase();
+        outputExt  = fmt;
+        outputPath = path.join(tmpDir, `th_out_${id}.${fmt}`);
+        outputName = `converted.${fmt}`;
+        const args = ['-i', inputPaths[0]];
+        if (fmt === 'mp4')  args.push('-vcodec', 'libx264', '-acodec', 'aac');
+        if (fmt === 'webm') args.push('-vcodec', 'libvpx-vp9', '-acodec', 'libopus');
+        if (fmt === 'avi')  args.push('-vcodec', 'mpeg4', '-acodec', 'mp3');
+        args.push('-y', outputPath);
+        await runFFmpeg(args);
+        break;
+      }
+
+      case 'to-mp3': {
+        outputExt  = 'mp3';
+        outputPath = path.join(tmpDir, `th_out_${id}.mp3`);
+        outputName = 'extracted_audio.mp3';
+        await runFFmpeg(['-i', inputPaths[0], '-vn', '-acodec', 'libmp3lame', '-q:a', '2', '-y', outputPath]);
+        break;
+      }
+
+      case 'video-to-gif': {
+        outputExt  = 'gif';
+        outputPath = path.join(tmpDir, `th_out_${id}.gif`);
+        outputName = 'output.gif';
+        const fps   = options.fps   || '10';
+        const scale = options.scale || '480';
+        await runFFmpeg(['-i', inputPaths[0], '-vf', `fps=${fps},scale=${scale}:-1:flags=lanczos`, '-loop', '0', '-y', outputPath]);
+        break;
+      }
+
+      case 'speed': {
+        outputExt  = 'mp4';
+        outputPath = path.join(tmpDir, `th_out_${id}.mp4`);
+        outputName = 'speed_changed.mp4';
+        const speed = parseFloat(options.speed || '1.5');
+        const pts   = (1 / speed).toFixed(6);
+        // Try with audio; fallback to video-only if no audio stream
+        try {
+          await runFFmpeg([
+            '-i', inputPaths[0],
+            '-filter_complex', `[0:v]setpts=${pts}*PTS[v];[0:a]atempo=${speed}[a]`,
+            '-map', '[v]', '-map', '[a]',
+            '-y', outputPath,
+          ]);
+        } catch {
+          // No audio stream — video-only
+          await runFFmpeg([
+            '-i', inputPaths[0],
+            '-vf', `setpts=${pts}*PTS`,
+            '-an', '-y', outputPath,
+          ]);
+        }
+        break;
+      }
+
+      case 'mute': {
+        outputExt  = 'mp4';
+        outputPath = path.join(tmpDir, `th_out_${id}.mp4`);
+        outputName = 'muted_video.mp4';
+        await runFFmpeg(['-i', inputPaths[0], '-an', '-c:v', 'copy', '-y', outputPath]);
+        break;
+      }
+
+      case 'merge': {
+        outputExt  = 'mp4';
+        outputPath = path.join(tmpDir, `th_out_${id}.mp4`);
+        outputName = 'merged_video.mp4';
+        const concatFile = path.join(tmpDir, `th_concat_${id}.txt`);
+        const lines = inputPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
+        fs.writeFileSync(concatFile, lines);
+        try {
+          await runFFmpeg(['-f', 'concat', '-safe', '0', '-i', concatFile, '-c', 'copy', '-y', outputPath]);
+        } finally {
+          fs.unlink(concatFile, () => {});
+        }
+        break;
+      }
+
+      default:
+        return res.status(400).json({ success: false, message: `Unknown video tool: ${toolSlug}` });
+    }
+
+    if (!fs.existsSync(outputPath)) {
+      return res.status(500).json({ success: false, message: 'Processing failed — output file not created.' });
+    }
+
+    const stat     = fs.statSync(outputPath);
+    const mimeType = videoMimeType(outputExt);
+
+    res.setHeader('Content-Disposition', `attachment; filename="${outputName}"`);
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('X-Output-Name', outputName);
+
+    logger.info('Streaming processed video', { toolSlug, size: stat.size, ext: outputExt });
+
+    const readStream = fs.createReadStream(outputPath);
+    readStream.pipe(res);
+    readStream.on('close', () => { fs.unlink(outputPath, () => {}); });
+    readStream.on('error', (err) => {
+      logger.error('Process stream error', { error: err.message });
+      fs.unlink(outputPath, () => {});
+      if (!res.headersSent) res.status(500).json({ success: false, message: err.message });
+    });
+
+  } catch (err) {
+    if (outputPath) fs.unlink(outputPath, () => {});
+    logger.error('Video process error', { toolSlug, error: err.message });
+    return res.status(500).json({ success: false, message: err.message });
+  } finally {
+    // Clean up input temp files
+    inputPaths.forEach((p) => fs.unlink(p, () => {}));
   }
 };

@@ -96,67 +96,80 @@ function getLangInstruction(language) {
   return map[language] ? `\n\n${map[language]}` : '';
 }
 
+// ─── Timeout wrapper ─────────────────────────────────────────────────────────
+
+function withTimeout(promise, ms = 10_000, label = 'Provider') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
 // ─── Core text generation — provider waterfall ───────────────────────────────
 
 /**
- * Generate text using DeepSeek → Groq → Gemini → Mistral → OpenRouter → OpenAI.
+ * Generate text using Groq → Gemini → Mistral → OpenRouter → DeepSeek → OpenAI.
+ * Groq is fastest and most reliable; known-broken providers (DeepSeek/OpenAI) are last.
+ * Each provider has a 10-second timeout to avoid blocking on slow responses.
  *
  * @param {string} systemPrompt
  * @param {string} userPrompt
  * @param {object} [options] — { provider, model, temperature, maxTokens, language }
  */
 async function generateText(systemPrompt, userPrompt, options = {}) {
-  // Append language instruction to system prompt if requested
   const langNote = getLangInstruction(options.language);
   if (langNote) systemPrompt = systemPrompt + langNote;
-  // 1. DeepSeek-V3 (primary — best for writing tasks)
-  if (!options.provider && process.env.DEEPSEEK_API_KEY) {
-    try {
-      return await generateWithDeepSeek(systemPrompt, userPrompt, options);
-    } catch (err) {
-      logger.warn('DeepSeek failed, falling back to Groq', { error: err.message });
-    }
-  }
 
-  // 2. Groq / Llama-3.3-70B (free fallback)
+  // 1. Groq / Llama-3.3-70B — fastest, generous free tier
   if (!options.provider && process.env.GROQ_API_KEY) {
     try {
-      return await generateWithGroq(systemPrompt, userPrompt, options);
+      return await withTimeout(generateWithGroq(systemPrompt, userPrompt, options), 10_000, 'Groq');
     } catch (err) {
       logger.warn('Groq failed, falling back to Gemini', { error: err.message });
     }
   }
 
-  // 3. Gemini Flash (free fallback)
+  // 2. Gemini Flash — free tier
   if (!options.provider && process.env.GEMINI_API_KEY) {
     try {
-      return await generateWithGemini(systemPrompt, userPrompt, options);
+      return await withTimeout(generateWithGemini(systemPrompt, userPrompt, options), 10_000, 'Gemini');
     } catch (err) {
       logger.warn('Gemini failed, falling back to Mistral', { error: err.message });
     }
   }
 
-  // 4. Mistral AI (free tier fallback)
+  // 3. Mistral AI — free tier fallback
   if (!options.provider && process.env.MISTRAL_API_KEY) {
     try {
-      return await generateWithMistral(systemPrompt, userPrompt, options);
+      return await withTimeout(generateWithMistral(systemPrompt, userPrompt, options), 10_000, 'Mistral');
     } catch (err) {
       logger.warn('Mistral failed, falling back to OpenRouter', { error: err.message });
     }
   }
 
-  // 5. OpenRouter — free Llama models (fallback)
+  // 4. OpenRouter — free Llama models
   if (!options.provider && process.env.OPENROUTER_API_KEY) {
     try {
-      return await generateWithOpenRouter(systemPrompt, userPrompt, options);
+      return await withTimeout(generateWithOpenRouter(systemPrompt, userPrompt, options), 10_000, 'OpenRouter');
     } catch (err) {
-      logger.warn('OpenRouter failed, falling back to OpenAI', { error: err.message });
+      logger.warn('OpenRouter failed, falling back to DeepSeek', { error: err.message });
     }
   }
 
-  // 6. OpenAI (last resort)
+  // 5. DeepSeek (last free resort — balance may be zero)
+  if (!options.provider && process.env.DEEPSEEK_API_KEY) {
+    try {
+      return await withTimeout(generateWithDeepSeek(systemPrompt, userPrompt, options), 10_000, 'DeepSeek');
+    } catch (err) {
+      logger.warn('DeepSeek failed, falling back to OpenAI', { error: err.message });
+    }
+  }
+
+  // 6. OpenAI (paid — last resort)
   try {
-    return await generateWithOpenAI(systemPrompt, userPrompt, options);
+    return await withTimeout(generateWithOpenAI(systemPrompt, userPrompt, options), 15_000, 'OpenAI');
   } catch (err) {
     logger.error('All AI providers failed', { error: err.message });
     throw new Error('AI generation failed — all providers exhausted. Please try again.');
