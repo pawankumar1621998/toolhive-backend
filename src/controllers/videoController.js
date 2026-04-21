@@ -217,6 +217,51 @@ function getCookiesFile(url) {
   return null;
 }
 
+// ─── Cobalt helper ────────────────────────────────────────────────────────────
+//
+// Cobalt (cobalt.tools) is a free multi-platform video CDN resolver.
+// It handles Instagram, TikTok, Facebook, Twitter/X, Pinterest, etc. without
+// requiring the user to supply cookies.  We call it first for non-YouTube URLs;
+// if it fails we fall through to yt-dlp.
+//
+async function tryCobalt(videoUrl, quality) {
+  const isAudioQ = quality === 'mp3';
+  const qMap     = { '4k': '2160', '1080p': '1080', '720p': '720', '480p': '480', '360p': '360', 'webm': '1080' };
+  const body = JSON.stringify({
+    url:          videoUrl,
+    downloadMode: isAudioQ ? 'audio' : 'auto',
+    videoQuality: qMap[quality] || '720',
+    ...(isAudioQ ? { audioFormat: 'mp3' } : {}),
+    filenameStyle: 'basic',
+  });
+
+  try {
+    const resp = await fetch('https://api.cobalt.tools/', {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept':       'application/json',
+        'User-Agent':   'ToolHive/1.0',
+      },
+      body,
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) {
+      logger.warn('Cobalt HTTP error', { status: resp.status });
+      return null;
+    }
+    const data = await resp.json();
+    if ((data.status === 'tunnel' || data.status === 'redirect') && data.url) {
+      logger.info('Cobalt success', { status: data.status });
+      return { url: data.url, filename: data.filename || null };
+    }
+    logger.warn('Cobalt non-success', { status: data.status, error: JSON.stringify(data.error) });
+  } catch (e) {
+    logger.warn('Cobalt request failed', { error: e.message });
+  }
+  return null;
+}
+
 exports.downloadVideoGet = (req, res) => {
   const { url, quality = '720p', validate } = req.query;
   if (!url || typeof url !== 'string' || !url.startsWith('http')) {
@@ -253,12 +298,28 @@ exports.downloadVideoGet = (req, res) => {
   }
 
   // ── Validate mode (?validate=1) ───────────────────────────────────────────
-  // Runs yt-dlp --print url — just checks whether the URL is downloadable
-  // (fast, no actual data transfer).  Frontend calls this first so it can
-  // show a React error if yt-dlp rejects the URL, then navigates with
-  // window.location.href for the real download.
+  // Phase-1 of the frontend download flow.  Returns JSON so the React UI can
+  // show errors before the browser navigates away for the real download.
+  //
+  // Strategy:
+  //  1. Non-YouTube → try Cobalt first (handles Instagram, TikTok, Facebook,
+  //     Twitter, Pinterest, etc. without cookies).  If Cobalt returns a direct
+  //     URL we send it back as `directUrl`; the frontend navigates there and
+  //     the real download needs no further yt-dlp involvement.
+  //  2. Cobalt fail OR YouTube → yt-dlp --print url (fast, no data transfer).
+  //     On success frontend navigates to the /video/download yt-dlp stream.
   if (validate === '1') {
-    logger.info('Video validate', { url, quality });
+    logger.info('Video validate', { url, quality, isYouTube });
+
+    // Step 1 — try Cobalt for non-YouTube
+    if (!isYouTube) {
+      const cobalt = await tryCobalt(url, quality);
+      if (cobalt) {
+        return res.json({ success: true, directUrl: cobalt.url, filename: cobalt.filename });
+      }
+    }
+
+    // Step 2 — yt-dlp --print url
     const checkProc = spawn(ytDlpBin, [
       ...baseArgs,
       '--print', 'url',
@@ -274,7 +335,7 @@ exports.downloadVideoGet = (req, res) => {
     const checkTimer = setTimeout(() => {
       checkProc.kill('SIGTERM');
       if (!res.headersSent) res.status(504).json({ success: false, message: 'Validation timed out. Please try again.' });
-    }, 25_000);
+    }, 30_000);
 
     checkProc.on('close', (code) => {
       clearTimeout(checkTimer);
