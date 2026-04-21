@@ -93,35 +93,51 @@ function getCookiesFile(url) {
 
 // ─── Cobalt helper (parallel instances) ──────────────────────────────────────
 //
-// Cobalt (cobalt.tools) resolves Instagram, TikTok, Twitter, Facebook, Pinterest
-// etc. without needing cookies.  We try multiple community instances in PARALLEL
-// so total wait = fastest responding instance (not sum of all timeouts).
+// Set COBALT_API_KEY env var on Render to use the official api.cobalt.tools
+// instance (most reliable). Without a key, we try many community instances.
 
-const COBALT_INSTANCES = [
-  'https://cobalt.api.trom.tf/',
-  'https://cobalt-api.hyper.lol/',
-  'https://api.cobalt.tools/',
-];
+const COBALT_API_KEY = process.env.COBALT_API_KEY || null;
+
+// If API key provided → official instance only; else try all community instances in parallel
+const COBALT_INSTANCES = COBALT_API_KEY
+  ? ['https://api.cobalt.tools/']
+  : [
+    'https://cobalt.catvibers.me/',
+    'https://co.wuk.sh/',
+    'https://cobalt.uli.rocks/',
+    'https://cobalt.api.trom.tf/',
+    'https://cobalt-api.hyper.lol/',
+    'https://cbl.raja.news/',
+    'https://cobalt.drgns.space/',
+    'https://api.cobalt.tools/',   // no-auth last resort (may 401)
+  ];
 
 async function tryCobaltInstance(apiUrl, bodyStr) {
   try {
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept':       'application/json',
+      'User-Agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Origin':       'https://cobalt.tools',
+      'Referer':      'https://cobalt.tools/',
+    };
+    if (COBALT_API_KEY && apiUrl.includes('api.cobalt.tools'))
+      headers['Authorization'] = `Api-Key ${COBALT_API_KEY}`;
+
     const resp = await fetch(apiUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept':       'application/json',
-        'User-Agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Origin':       'https://cobalt.tools',
-        'Referer':      'https://cobalt.tools/',
-      },
+      headers,
       body:   bodyStr,
-      signal: AbortSignal.timeout(10_000),   // 10 s per instance
+      signal: AbortSignal.timeout(10_000),
     });
 
     const text = await resp.text();
-    logger.info('Cobalt response', { instance: apiUrl, status: resp.status, snippet: text.slice(0, 200) });
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      logger.warn('Cobalt non-OK', { instance: apiUrl, status: resp.status, body: text.slice(0, 200) });
+      return null;
+    }
 
+    logger.info('Cobalt success', { instance: apiUrl, snippet: text.slice(0, 200) });
     const data = JSON.parse(text);
 
     if ((data.status === 'tunnel' || data.status === 'redirect') && data.url)
@@ -132,6 +148,56 @@ async function tryCobaltInstance(apiUrl, bodyStr) {
 
   } catch (e) {
     logger.warn('Cobalt instance error', { instance: apiUrl, error: e.message });
+  }
+  return null;
+}
+
+// ─── Instagram embed scraper (fallback when all Cobalt instances fail) ────────
+// Fetches Instagram's public embed page, parses the CDN video URL from the HTML.
+// Returns { url, filename } where url is a scontent CDN link the browser can
+// download directly — no Cobalt required.
+
+async function tryInstagramEmbed(videoUrl) {
+  const match = videoUrl.match(/instagram\.com\/(?:p|reel|tv)\/([A-Za-z0-9_-]+)/);
+  if (!match) return null;
+  const shortcode = match[1];
+
+  for (const embedPath of [`/p/${shortcode}/embed/captioned/`, `/p/${shortcode}/embed/`]) {
+    try {
+      const resp = await fetch(`https://www.instagram.com${embedPath}`, {
+        headers: {
+          'User-Agent':      'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+          'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Referer':         'https://www.instagram.com/',
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (!resp.ok) { logger.warn('Instagram embed non-OK', { status: resp.status }); continue; }
+
+      const html = await resp.text();
+
+      // Pattern 1: "video_url":"https://..."
+      let m = html.match(/"video_url"\s*:\s*"([^"]+)"/);
+      if (m) {
+        const url = m[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+        logger.info('Instagram embed: video_url found', { shortcode });
+        return { url, filename: `instagram_${shortcode}.mp4` };
+      }
+
+      // Pattern 2: <video src="...">
+      m = html.match(/<video[^>]+src="([^"]+)"/);
+      if (m) {
+        const url = m[1].replace(/&amp;/g, '&');
+        logger.info('Instagram embed: video src found', { shortcode });
+        return { url, filename: `instagram_${shortcode}.mp4` };
+      }
+
+      logger.warn('Instagram embed: no video URL in HTML', { shortcode, len: html.length });
+    } catch (e) {
+      logger.warn('Instagram embed error', { error: e.message, shortcode });
+    }
   }
   return null;
 }
@@ -158,7 +224,7 @@ async function tryCobalt(videoUrl, quality) {
   });
 
   // All instances start at the same time — first non-null result wins
-  return new Promise((resolve) => {
+  const cobaltResult = await new Promise((resolve) => {
     let pending = COBALT_INSTANCES.length;
     let settled = false;
 
@@ -171,6 +237,17 @@ async function tryCobalt(videoUrl, quality) {
         .catch(() => { if (--pending === 0 && !settled) resolve(null); });
     }
   });
+
+  if (cobaltResult) return cobaltResult;
+
+  // Instagram-specific fallback: scrape the public embed page for the CDN URL
+  if (/instagram\.com/.test(videoUrl) && !isAudioQ) {
+    logger.info('All Cobalt failed for Instagram — trying embed scrape');
+    const embedResult = await tryInstagramEmbed(videoUrl);
+    if (embedResult) return embedResult;
+  }
+
+  return null;
 }
 
 // ─── Format selectors ─────────────────────────────────────────────────────────
