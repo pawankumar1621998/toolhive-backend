@@ -104,10 +104,12 @@ exports.getVideoInfo = async (req, res) => {
       retries:             2,
       ffmpegLocation:      ffmpegPath,
     };
-    // YouTube-only bot-detection bypass — applying it globally breaks other extractors
     if (/youtube\.com|youtu\.be/.test(url)) {
       ytDlpOpts.extractorArgs = 'youtube:player_client=android,web';
     }
+    const cookiesFile = getCookiesFile(url);
+    if (cookiesFile) ytDlpOpts.cookies = cookiesFile;
+
     const info = await ytDlp(url, ytDlpOpts);
 
     return res.json({
@@ -168,11 +170,55 @@ function getYtDlpBin() {
       if (fs.existsSync(p)) return p;
     }
   } catch { /* ignore */ }
-  return 'yt-dlp'; // fallback: system PATH
+  return 'yt-dlp';
+}
+
+// ─── Cookies ──────────────────────────────────────────────────────────────────
+//
+// Set these environment variables on Render to enable Instagram / Facebook
+// downloads.  The value is the contents of a Netscape-format cookies.txt file,
+// base64-encoded (so it fits in a single env-var string).
+//
+// How to get your cookies.txt:
+//   1. Install the "Get cookies.txt LOCALLY" Chrome extension.
+//   2. Log into Instagram (or Facebook) in that browser tab.
+//   3. Click the extension icon → Export → save the file.
+//   4. Base64-encode it:  node -e "process.stdout.write(require('fs').readFileSync('cookies.txt').toString('base64'))"
+//   5. Paste the result as INSTAGRAM_COOKIES (or FACEBOOK_COOKIES) in Render → Environment.
+//   6. Click "Save Changes" and redeploy.
+//
+// The cookies file is refreshed on every server restart.  Re-export when your
+// Instagram session expires (usually every few weeks).
+
+const _cookieFiles = {};
+
+(function loadCookies() {
+  const map = [
+    ['INSTAGRAM_COOKIES', 'instagram'],
+    ['FACEBOOK_COOKIES',  'facebook'],
+  ];
+  for (const [envKey, label] of map) {
+    const b64 = process.env[envKey];
+    if (!b64) continue;
+    try {
+      const filePath = path.join(os.tmpdir(), `th_cookies_${label}.txt`);
+      fs.writeFileSync(filePath, Buffer.from(b64, 'base64').toString('utf8'), { mode: 0o600 });
+      _cookieFiles[label] = filePath;
+      logger.info(`Loaded ${label} cookies`, { path: filePath });
+    } catch (e) {
+      logger.warn(`Failed to write ${label} cookies file`, { error: e.message });
+    }
+  }
+}());
+
+function getCookiesFile(url) {
+  if (/instagram\.com/.test(url))           return _cookieFiles.instagram || null;
+  if (/facebook\.com|fb\.watch/.test(url))  return _cookieFiles.facebook  || null;
+  return null;
 }
 
 exports.downloadVideoGet = (req, res) => {
-  const { url, quality = '720p' } = req.query;
+  const { url, quality = '720p', validate } = req.query;
   if (!url || typeof url !== 'string' || !url.startsWith('http')) {
     return res.status(400).json({ success: false, message: 'A valid video URL is required.' });
   }
@@ -181,42 +227,71 @@ exports.downloadVideoGet = (req, res) => {
   const ext       = isAudio ? 'mp3' : 'mp4';
   const isYouTube = /youtube\.com|youtu\.be/.test(url);
 
-  // YouTube supports separate video+audio merge via stdout (-o -) + ffmpeg.
-  // Other platforms (Instagram, TikTok, Facebook, Twitter, Vimeo…) serve
-  // pre-merged single-file formats — using bestvideo+bestaudio on them fails
-  // because yt-dlp cannot merge two separate streams while writing to stdout.
   const format = isYouTube
     ? (STREAM_FORMAT[quality]  || STREAM_FORMAT['720p'])
     : (SIMPLE_FORMAT[quality] || 'best');
 
-  logger.info('Video stream GET', { url, quality, format, isYouTube });
+  const ytDlpBin    = getYtDlpBin();
+  const cookiesFile = getCookiesFile(url);
 
-  const ytDlpBin = getYtDlpBin();
-
-  const args = [
-    url, '-f', format, '-o', '-',
+  // ── Shared base args ──────────────────────────────────────────────────────
+  const baseArgs = [
+    url, '-f', format,
     '--no-playlist',
-    '--socket-timeout', '60',
-    '--retries', '2',
     '--no-warnings',
     '--no-call-home',
     '--no-check-certificates',
     '--ffmpeg-location', ffmpegPath,
   ];
-
-  // YouTube-specific bot-detection bypass — breaks other extractors if applied globally
-  if (isYouTube) args.push('--extractor-args', 'youtube:player_client=android,web');
-
-  // Instagram / Facebook: send a mobile browser user-agent to reduce rate-limiting.
-  // Note: server IPs are often blocked regardless — cookies would be the real fix,
-  // but we surface a clear error message when it fails.
+  if (isYouTube) baseArgs.push('--extractor-args', 'youtube:player_client=android,web');
+  if (cookiesFile) baseArgs.push('--cookies', cookiesFile);
   if (/instagram\.com|facebook\.com|fb\.watch/.test(url)) {
-    args.push(
+    baseArgs.push(
       '--add-header', 'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
       '--add-header', 'Accept-Language:en-US,en;q=0.9',
     );
   }
 
+  // ── Validate mode (?validate=1) ───────────────────────────────────────────
+  // Runs yt-dlp --print url — just checks whether the URL is downloadable
+  // (fast, no actual data transfer).  Frontend calls this first so it can
+  // show a React error if yt-dlp rejects the URL, then navigates with
+  // window.location.href for the real download.
+  if (validate === '1') {
+    logger.info('Video validate', { url, quality });
+    const checkProc = spawn(ytDlpBin, [
+      ...baseArgs,
+      '--print', 'url',
+      '--socket-timeout', '20',
+      '--retries', '1',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let checkOut = '';
+    let checkErr = '';
+    checkProc.stdout.on('data', (d) => { checkOut += d.toString(); });
+    checkProc.stderr.on('data', (d) => { checkErr = (checkErr + d.toString()).slice(-2000); });
+
+    const checkTimer = setTimeout(() => {
+      checkProc.kill('SIGTERM');
+      if (!res.headersSent) res.status(504).json({ success: false, message: 'Validation timed out. Please try again.' });
+    }, 25_000);
+
+    checkProc.on('close', (code) => {
+      clearTimeout(checkTimer);
+      if (res.headersSent) return;
+      if (code === 0 && checkOut.trim()) {
+        res.json({ success: true });
+      } else {
+        res.status(400).json({ success: false, message: ytDlpErrorMessage({ message: checkErr }) });
+      }
+    });
+    return;
+  }
+
+  // ── Full download ─────────────────────────────────────────────────────────
+  logger.info('Video stream GET', { url, quality, format, isYouTube, hasCookies: !!cookiesFile });
+
+  const args = [...baseArgs, '-o', '-', '--socket-timeout', '60', '--retries', '2'];
   if (isAudio) {
     args.push('--extract-audio', '--audio-format', 'mp3');
   } else {
