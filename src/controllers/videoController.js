@@ -132,7 +132,7 @@ exports.getVideoInfo = async (req, res) => {
  * Browser receives the attachment header in <1s → shows download dialog and
  * closes the blank tab instantly (Chrome behaviour). No more 60-second wait.
  */
-// Formats that allow separate streams — ffmpeg merges them to mp4 via stdout
+// YouTube: separate video+audio streams merged by ffmpeg
 const STREAM_FORMAT = {
   '4k':    'bestvideo[height<=2160]+bestaudio/best[height<=2160]',
   '1080p': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
@@ -141,6 +141,18 @@ const STREAM_FORMAT = {
   '360p':  'best[height<=360]/worst',
   'mp3':   'bestaudio/best',
   'webm':  'bestvideo[height<=1080][ext=webm]+bestaudio[ext=webm]/best[ext=webm]',
+};
+
+// Non-YouTube (Instagram, TikTok, Facebook, etc.): pre-merged single-file formats
+// bestvideo+bestaudio requires separate streams which most platforms don't serve
+const SIMPLE_FORMAT = {
+  '4k':    'best[height<=2160]/best',
+  '1080p': 'best[height<=1080]/best',
+  '720p':  'best[height<=720]/best',
+  '480p':  'best[height<=480]/best',
+  '360p':  'best[height<=360]/worst',
+  'mp3':   'bestaudio/best',
+  'webm':  'best[ext=webm]/best',
 };
 
 function getYtDlpBin() {
@@ -160,55 +172,96 @@ exports.downloadVideoGet = (req, res) => {
     return res.status(400).json({ success: false, message: 'A valid video URL is required.' });
   }
 
-  const isAudio = quality === 'mp3';
-  const isWebm  = quality === 'webm';
-  const ext     = isAudio ? 'mp3' : isWebm ? 'webm' : 'mp4';
-  const format  = STREAM_FORMAT[quality] || STREAM_FORMAT['720p'];
+  const isAudio   = quality === 'mp3';
+  const ext       = isAudio ? 'mp3' : 'mp4';
+  const isYouTube = /youtube\.com|youtu\.be/.test(url);
 
-  logger.info('Video stream GET', { url, quality });
+  // YouTube supports separate video+audio merge via stdout (-o -) + ffmpeg.
+  // Other platforms (Instagram, TikTok, Facebook, Twitter, Vimeo…) serve
+  // pre-merged single-file formats — using bestvideo+bestaudio on them fails
+  // because yt-dlp cannot merge two separate streams while writing to stdout.
+  const format = isYouTube
+    ? (STREAM_FORMAT[quality]  || STREAM_FORMAT['720p'])
+    : (SIMPLE_FORMAT[quality] || 'best');
 
-  // Flush headers immediately — browser gets Content-Disposition: attachment
-  // in <1 second, Chrome closes blank tab, download indicator appears right away.
-  res.setHeader('Content-Disposition', `attachment; filename="video.${ext}"`);
-  res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : isWebm ? 'video/webm' : 'video/mp4');
-  res.setHeader('Cache-Control', 'no-store');
-  res.flushHeaders();
+  logger.info('Video stream GET', { url, quality, format, isYouTube });
 
   const ytDlpBin = getYtDlpBin();
 
-  // --merge-output-format mp4 ensures ffmpeg outputs proper mp4 (not webm/mkv)
-  // even when merging separate video+audio streams
-  const extraArgs = isAudio
-    ? ['--extract-audio', '--audio-format', 'mp3']
-    : ['--merge-output-format', 'mp4'];
-
-  const proc = spawn(ytDlpBin, [
-    url,
-    '-f', format,
-    '-o', '-',                // write to stdout (pipe to HTTP response in real-time)
-    ...extraArgs,
+  const args = [
+    url, '-f', format, '-o', '-',
     '--no-playlist',
     '--socket-timeout', '60',
     '--retries', '2',
     '--no-warnings',
     '--no-call-home',
     '--no-check-certificates',
-    '--extractor-args', 'youtube:player_client=android,web',
     '--ffmpeg-location', ffmpegPath,
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  ];
 
-  proc.stdout.pipe(res);
+  // YouTube-specific bot-detection bypass — breaks other extractors if applied globally
+  if (isYouTube) args.push('--extractor-args', 'youtube:player_client=android,web');
 
-  // Kill yt-dlp if the client disconnects to avoid zombie processes
-  req.on('close', () => { if (!proc.killed) proc.kill('SIGTERM'); });
+  if (isAudio) {
+    args.push('--extract-audio', '--audio-format', 'mp3');
+  } else {
+    args.push('--merge-output-format', 'mp4');
+  }
+
+  const proc = spawn(ytDlpBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  let headersFlushed = false;
+  let stderrBuf     = '';
+  let startupTimer  = null;
+
+  proc.stderr.on('data', (d) => {
+    stderrBuf = (stderrBuf + d.toString()).slice(-3000);
+  });
+
+  // If yt-dlp produces no output within 45 s, give up and return a JSON error.
+  startupTimer = setTimeout(() => {
+    if (!headersFlushed && !res.writableEnded) {
+      proc.kill('SIGTERM');
+      res.status(504).json({ success: false, message: 'Download timed out. Please try again.' });
+    }
+  }, 45_000);
+
+  // Delay flushing headers until yt-dlp actually starts sending data.
+  // This way, if yt-dlp fails immediately we can still return a JSON error
+  // instead of an empty/corrupt file that the browser silently "downloads".
+  proc.stdout.on('data', (chunk) => {
+    if (!headersFlushed) {
+      headersFlushed = true;
+      clearTimeout(startupTimer);
+      res.setHeader('Content-Disposition', `attachment; filename="video.${ext}"`);
+      res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+      res.setHeader('Cache-Control', 'no-store');
+      res.flushHeaders();
+    }
+    res.write(chunk);
+  });
+
+  req.on('close', () => {
+    clearTimeout(startupTimer);
+    if (!proc.killed) proc.kill('SIGTERM');
+  });
 
   proc.on('error', (err) => {
+    clearTimeout(startupTimer);
     logger.error('yt-dlp spawn error', { error: err.message });
-    if (!res.writableEnded) res.end();
+    if (!headersFlushed && !res.writableEnded) {
+      res.status(500).json({ success: false, message: 'Failed to start download.' });
+    } else if (!res.writableEnded) res.end();
   });
 
   proc.on('close', (code) => {
-    if (code !== 0) logger.warn('yt-dlp exited non-zero', { code });
+    clearTimeout(startupTimer);
+    if (code !== 0 && code !== null) logger.warn('yt-dlp exited non-zero', { code, url, quality });
+    if (!headersFlushed && !res.writableEnded) {
+      // yt-dlp quit before sending any data — send a proper error message
+      const msg = ytDlpErrorMessage({ message: stderrBuf });
+      return res.status(400).json({ success: false, message: msg });
+    }
     if (!res.writableEnded) res.end();
   });
 };
