@@ -196,6 +196,14 @@ exports.runAiTool = async (req, res) => {
       result = await aiService.writeCoverLetter(body.name, body.jobTitle, body.company, body.experience, body.skills, opts());
       break;
 
+    case 'resignation-letter':
+      if (!body.name || !body.position) throw new ApiError(400, 'name and position are required');
+      result = await aiService.generic('resignation-letter',
+        `Write a professional resignation letter with these details:\nName: ${body.name}\nPosition: ${body.position}\nCompany: ${body.company || 'the company'}\nManager: ${body.manager || 'Hiring Manager'}\nLast Working Day: ${body.lastDay || 'two weeks from the date of this letter'}\nTone: ${body.tone || 'Professional'}\nReason for leaving: ${body.reason || 'pursuing new opportunities'}\n\nWrite a complete, ready-to-send resignation letter. Include today's date at top, proper salutation, 3-4 body paragraphs (intention to resign + last day, gratitude, offer to help with transition, closing), and a professional sign-off. Do NOT use placeholder brackets like [Your Address] or [Date] — write natural flowing text.`,
+        opts({ maxTokens: 800 })
+      );
+      break;
+
     case 'resume-summary':
       if (!body.name || !body.jobTitle) throw new ApiError(400, 'name and jobTitle are required');
       result = await aiService.generateResumeSummaries(body.name, body.jobTitle, body.experience, body.skills || [], body.achievement, body.tone, opts());
