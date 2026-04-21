@@ -67,7 +67,9 @@ function ytDlpErrorMessage(err) {
   if (raw.includes('requires payment'))            return 'This video requires purchase and cannot be downloaded.';
   if (raw.includes('Private video'))               return 'This is a private video and cannot be downloaded.';
   if (raw.includes('login required') || raw.includes('rate-limit') || raw.includes('Requested content is not available'))
-    return 'Instagram/Facebook has blocked this download — these platforms require a logged-in session from a real browser. Please try a YouTube, TikTok, Twitter, or Vimeo URL instead.';
+    return 'Instagram has blocked this download from our server. Try a different reel or use YouTube, TikTok, or Twitter instead.';
+  if (raw.includes('curl_cffi') || (raw.includes('impersonat') && raw.includes('not')))
+    return 'Instagram download is not supported on this server build. Please try YouTube, TikTok, or Twitter instead.';
   if (raw.includes('429'))                         return 'Too many requests to the platform. Please wait a minute and try again.';
   if (raw.includes('403'))                         return 'Access denied by the platform. The video may be region-locked or require login.';
   if (raw.includes('not supported') || raw.includes('No video formats found'))
@@ -218,47 +220,83 @@ function getCookiesFile(url) {
 }
 
 // ─── Cobalt helper ────────────────────────────────────────────────────────────
-//
-// Cobalt (cobalt.tools) is a free multi-platform video CDN resolver.
-// It handles Instagram, TikTok, Facebook, Twitter/X, Pinterest, etc. without
-// requiring the user to supply cookies.  We call it first for non-YouTube URLs;
-// if it fails we fall through to yt-dlp.
-//
-async function tryCobalt(videoUrl, quality) {
-  const isAudioQ = quality === 'mp3';
-  const qMap     = { '4k': '2160', '1080p': '1080', '720p': '720', '480p': '480', '360p': '360', 'webm': '1080' };
-  const body = JSON.stringify({
-    url:          videoUrl,
-    downloadMode: isAudioQ ? 'audio' : 'auto',
-    videoQuality: qMap[quality] || '720',
-    ...(isAudioQ ? { audioFormat: 'mp3' } : {}),
-    filenameStyle: 'basic',
-  });
 
+// Public Cobalt instances to try in order
+const COBALT_INSTANCES = [
+  'https://api.cobalt.tools/',
+  'https://cobalt.api.trom.tf/',
+  'https://cobalt-api.hyper.lol/',
+];
+
+async function tryCobaltInstance(apiUrl, cleanUrl, bodyStr) {
   try {
-    const resp = await fetch('https://api.cobalt.tools/', {
+    const resp = await fetch(apiUrl, {
       method:  'POST',
       headers: {
         'Content-Type': 'application/json',
         'Accept':       'application/json',
-        'User-Agent':   'ToolHive/1.0',
+        // Cobalt checks that requests look like they come from a real browser
+        'User-Agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Origin':       'https://cobalt.tools',
+        'Referer':      'https://cobalt.tools/',
       },
-      body,
-      signal: AbortSignal.timeout(15_000),
+      body:   bodyStr,
+      signal: AbortSignal.timeout(18_000),
     });
-    if (!resp.ok) {
-      logger.warn('Cobalt HTTP error', { status: resp.status });
-      return null;
+
+    const rawText = await resp.text();
+    logger.info('Cobalt raw response', { instance: apiUrl, status: resp.status, body: rawText.slice(0, 300) });
+
+    if (!resp.ok) return null;
+
+    let data;
+    try { data = JSON.parse(rawText); } catch { return null; }
+
+    // status can be "tunnel" (proxied), "redirect" (direct CDN), or "picker" (multiple)
+    if (data.status === 'tunnel' || data.status === 'redirect') {
+      if (data.url) return { url: data.url, filename: data.filename || null };
     }
-    const data = await resp.json();
-    if ((data.status === 'tunnel' || data.status === 'redirect') && data.url) {
-      logger.info('Cobalt success', { status: data.status });
-      return { url: data.url, filename: data.filename || null };
+    if (data.status === 'picker' && Array.isArray(data.picker) && data.picker.length > 0) {
+      // Take the first (best quality) item
+      const first = data.picker[0];
+      if (first.url) return { url: first.url, filename: data.filename || null };
     }
-    logger.warn('Cobalt non-success', { status: data.status, error: JSON.stringify(data.error) });
   } catch (e) {
-    logger.warn('Cobalt request failed', { error: e.message });
+    logger.warn('Cobalt instance failed', { instance: apiUrl, error: e.message });
   }
+  return null;
+}
+
+async function tryCobalt(videoUrl, quality) {
+  const isAudioQ = quality === 'mp3';
+  const qMap     = { '4k': '2160', '1080p': '1080', '720p': '720', '480p': '480', '360p': '360', 'webm': '1080' };
+
+  // Strip Instagram/TikTok tracking query params — they can confuse some Cobalt instances
+  let cleanUrl = videoUrl;
+  try {
+    const u = new URL(videoUrl);
+    if (/instagram\.com|tiktok\.com/.test(u.hostname)) {
+      cleanUrl = u.origin + u.pathname.replace(/\/$/, '');
+    }
+  } catch { /* keep original */ }
+
+  const bodyStr = JSON.stringify({
+    url:          cleanUrl,
+    downloadMode: isAudioQ ? 'audio' : 'auto',
+    videoQuality: qMap[quality] || '720',
+    filenameStyle: 'basic',
+    alwaysProxy:  true,   // force Cobalt to proxy; avoids CDN URLs that may be region-blocked
+    ...(isAudioQ ? { audioFormat: 'mp3' } : {}),
+  });
+
+  for (const instance of COBALT_INSTANCES) {
+    const result = await tryCobaltInstance(instance, cleanUrl, bodyStr);
+    if (result) {
+      logger.info('Cobalt success', { instance, status: 'ok' });
+      return result;
+    }
+  }
+  logger.warn('All Cobalt instances failed for', { url: cleanUrl });
   return null;
 }
 
@@ -291,10 +329,11 @@ exports.downloadVideoGet = async (req, res) => {
   if (isYouTube) baseArgs.push('--extractor-args', 'youtube:player_client=android,web');
   if (cookiesFile) baseArgs.push('--cookies', cookiesFile);
   if (/instagram\.com|facebook\.com|fb\.watch/.test(url)) {
-    baseArgs.push(
-      '--add-header', 'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-      '--add-header', 'Accept-Language:en-US,en;q=0.9',
-    );
+    // --impersonate chrome tells yt-dlp to use curl_cffi to mimic Chrome's
+    // TLS fingerprint + HTTP headers — helps bypass Instagram bot detection.
+    // If curl_cffi is not available on this build, yt-dlp will exit with an
+    // error that we handle in ytDlpErrorMessage.
+    baseArgs.push('--impersonate', 'chrome');
   }
 
   // ── Validate mode (?validate=1) ───────────────────────────────────────────
