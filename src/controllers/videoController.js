@@ -66,8 +66,10 @@ function ytDlpErrorMessage(err) {
   if (raw.includes('Video unavailable'))           return 'This video is unavailable or has been removed.';
   if (raw.includes('requires payment'))            return 'This video requires purchase and cannot be downloaded.';
   if (raw.includes('Private video'))               return 'This is a private video and cannot be downloaded.';
+  if (raw.includes('login required') || raw.includes('rate-limit') || raw.includes('Requested content is not available'))
+    return 'Instagram/Facebook has blocked this download — these platforms require a logged-in session from a real browser. Please try a YouTube, TikTok, Twitter, or Vimeo URL instead.';
   if (raw.includes('429'))                         return 'Too many requests to the platform. Please wait a minute and try again.';
-  if (raw.includes('403'))                         return 'Access denied by the platform. The video may be region-locked.';
+  if (raw.includes('403'))                         return 'Access denied by the platform. The video may be region-locked or require login.';
   if (raw.includes('not supported') || raw.includes('No video formats found'))
     return 'This URL or platform is not supported.';
   if (raw.includes('timed out') || raw.includes('timeout'))
@@ -76,7 +78,7 @@ function ytDlpErrorMessage(err) {
   const lines = raw.split('\n').map((l) => l.trim()).filter(Boolean);
   const errorLine = lines.find((l) => l.startsWith('ERROR:'));
   if (errorLine) return errorLine.replace(/^ERROR:\s*\[[^\]]+\]\s*[^:]+:\s*/, '');
-  return 'Could not fetch video info. The URL may be invalid or the platform may be temporarily unavailable.';
+  return 'Could not download this video. The URL may be invalid, the platform may require login, or the video may be restricted.';
 }
 
 /**
@@ -92,7 +94,7 @@ exports.getVideoInfo = async (req, res) => {
   logger.info('Video info request', { url });
 
   try {
-    const info = await ytDlp(url, {
+    const ytDlpOpts = {
       dumpSingleJson:      true,
       noWarnings:          true,
       noCallHome:          true,
@@ -100,10 +102,13 @@ exports.getVideoInfo = async (req, res) => {
       noPlaylist:          true,
       socketTimeout:       30,
       retries:             2,
-      // Use Android + web clients — bypasses YouTube bot detection on server IPs
-      extractorArgs:       'youtube:player_client=android,web',
       ffmpegLocation:      ffmpegPath,
-    });
+    };
+    // YouTube-only bot-detection bypass — applying it globally breaks other extractors
+    if (/youtube\.com|youtu\.be/.test(url)) {
+      ytDlpOpts.extractorArgs = 'youtube:player_client=android,web';
+    }
+    const info = await ytDlp(url, ytDlpOpts);
 
     return res.json({
       success: true,
@@ -201,6 +206,16 @@ exports.downloadVideoGet = (req, res) => {
 
   // YouTube-specific bot-detection bypass — breaks other extractors if applied globally
   if (isYouTube) args.push('--extractor-args', 'youtube:player_client=android,web');
+
+  // Instagram / Facebook: send a mobile browser user-agent to reduce rate-limiting.
+  // Note: server IPs are often blocked regardless — cookies would be the real fix,
+  // but we surface a clear error message when it fails.
+  if (/instagram\.com|facebook\.com|fb\.watch/.test(url)) {
+    args.push(
+      '--add-header', 'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+      '--add-header', 'Accept-Language:en-US,en;q=0.9',
+    );
+  }
 
   if (isAudio) {
     args.push('--extract-audio', '--audio-format', 'mp3');
