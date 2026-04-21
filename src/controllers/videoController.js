@@ -125,11 +125,14 @@ exports.getVideoInfo = async (req, res) => {
 
 /**
  * GET /video/download?url=...&quality=...
- * Fast path: uses yt-dlp --get-url to extract the direct CDN URL in ~10s,
- * then 302-redirects the browser to it. Browser downloads directly from CDN.
- * Falls back to full streaming if --get-url fails.
+ *
+ * Sends Content-Disposition: attachment headers IMMEDIATELY via res.flushHeaders(),
+ * then pipes yt-dlp stdout directly to the response — data streams in real-time.
+ *
+ * Browser receives the attachment header in <1s → shows download dialog and
+ * closes the blank tab instantly (Chrome behaviour). No more 60-second wait.
  */
-const SIMPLE_FORMAT = {
+const STREAM_FORMAT = {
   '4k':    'best[height<=2160][ext=mp4]/best[height<=2160]',
   '1080p': 'best[height<=1080][ext=mp4]/best[height<=1080]',
   '720p':  'best[height<=720][ext=mp4]/best[height<=720]',
@@ -139,40 +142,67 @@ const SIMPLE_FORMAT = {
   'webm':  'best[height<=1080][ext=webm]/best[ext=webm]',
 };
 
-exports.downloadVideoGet = async (req, res) => {
+function getYtDlpBin() {
+  try {
+    const pkgDir = path.dirname(require.resolve('yt-dlp-exec/package.json'));
+    for (const name of ['yt-dlp', 'yt-dlp_linux', 'yt-dlp_macos', 'yt-dlp.exe']) {
+      const p = path.join(pkgDir, 'bin', name);
+      if (fs.existsSync(p)) return p;
+    }
+  } catch { /* ignore */ }
+  return 'yt-dlp'; // fallback: system PATH
+}
+
+exports.downloadVideoGet = (req, res) => {
   const { url, quality = '720p' } = req.query;
   if (!url || typeof url !== 'string' || !url.startsWith('http')) {
     return res.status(400).json({ success: false, message: 'A valid video URL is required.' });
   }
 
-  logger.info('Video download GET (fast redirect mode)', { url, quality });
+  const isAudio = quality === 'mp3';
+  const isWebm  = quality === 'webm';
+  const ext     = isAudio ? 'mp3' : isWebm ? 'webm' : 'mp4';
+  const format  = STREAM_FORMAT[quality] || STREAM_FORMAT['720p'];
 
-  const format = SIMPLE_FORMAT[quality] || SIMPLE_FORMAT['720p'];
+  logger.info('Video stream GET', { url, quality });
 
-  try {
-    // --get-url prints the direct CDN URL without downloading (~5-15s)
-    const output = await ytDlp(url, {
-      getUrl:              true,
-      format,
-      noWarnings:          true,
-      noCallHome:          true,
-      noCheckCertificates: true,
-      noPlaylist:          true,
-      socketTimeout:       30,
-      extractorArgs:       'youtube:player_client=android,web',
-    });
+  // Flush headers immediately — browser gets Content-Disposition: attachment
+  // in <1 second, Chrome closes blank tab, download indicator appears right away.
+  res.setHeader('Content-Disposition', `attachment; filename="video.${ext}"`);
+  res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : isWebm ? 'video/webm' : 'video/mp4');
+  res.setHeader('Cache-Control', 'no-store');
+  res.flushHeaders();
 
-    const directUrl = String(output).trim().split('\n')[0].trim();
-    if (directUrl && directUrl.startsWith('http')) {
-      logger.info('Redirecting to direct URL', { url: directUrl.slice(0, 100) });
-      return res.redirect(302, directUrl);
-    }
-    throw new Error('Empty URL from --get-url');
-  } catch (err) {
-    logger.warn('get-url failed, falling back to streaming', { error: err.message });
-    req.body = { url, quality };
-    return exports.downloadVideo(req, res);
-  }
+  const ytDlpBin = getYtDlpBin();
+
+  const proc = spawn(ytDlpBin, [
+    url,
+    '-f', format,
+    '-o', '-',                // write to stdout (pipe to HTTP response in real-time)
+    '--no-playlist',
+    '--socket-timeout', '60',
+    '--retries', '2',
+    '--no-warnings',
+    '--no-call-home',
+    '--no-check-certificates',
+    '--extractor-args', 'youtube:player_client=android,web',
+    '--ffmpeg-location', ffmpegPath,
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  proc.stdout.pipe(res);
+
+  // Kill yt-dlp if the client disconnects to avoid zombie processes
+  req.on('close', () => { if (!proc.killed) proc.kill('SIGTERM'); });
+
+  proc.on('error', (err) => {
+    logger.error('yt-dlp spawn error', { error: err.message });
+    if (!res.writableEnded) res.end();
+  });
+
+  proc.on('close', (code) => {
+    if (code !== 0) logger.warn('yt-dlp exited non-zero', { code });
+    if (!res.writableEnded) res.end();
+  });
 };
 
 /**
