@@ -132,14 +132,15 @@ exports.getVideoInfo = async (req, res) => {
  * Browser receives the attachment header in <1s → shows download dialog and
  * closes the blank tab instantly (Chrome behaviour). No more 60-second wait.
  */
+// Formats that allow separate streams — ffmpeg merges them to mp4 via stdout
 const STREAM_FORMAT = {
-  '4k':    'best[height<=2160][ext=mp4]/best[height<=2160]',
-  '1080p': 'best[height<=1080][ext=mp4]/best[height<=1080]',
-  '720p':  'best[height<=720][ext=mp4]/best[height<=720]',
-  '480p':  'best[height<=480][ext=mp4]/best[height<=480]',
-  '360p':  'best[height<=360][ext=mp4]/worst',
-  'mp3':   'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',
-  'webm':  'best[height<=1080][ext=webm]/best[ext=webm]',
+  '4k':    'bestvideo[height<=2160]+bestaudio/best[height<=2160]',
+  '1080p': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
+  '720p':  'bestvideo[height<=720]+bestaudio/best[height<=720]',
+  '480p':  'bestvideo[height<=480]+bestaudio/best[height<=480]',
+  '360p':  'best[height<=360]/worst',
+  'mp3':   'bestaudio/best',
+  'webm':  'bestvideo[height<=1080][ext=webm]+bestaudio[ext=webm]/best[ext=webm]',
 };
 
 function getYtDlpBin() {
@@ -175,10 +176,17 @@ exports.downloadVideoGet = (req, res) => {
 
   const ytDlpBin = getYtDlpBin();
 
+  // --merge-output-format mp4 ensures ffmpeg outputs proper mp4 (not webm/mkv)
+  // even when merging separate video+audio streams
+  const extraArgs = isAudio
+    ? ['--extract-audio', '--audio-format', 'mp3']
+    : ['--merge-output-format', 'mp4'];
+
   const proc = spawn(ytDlpBin, [
     url,
     '-f', format,
     '-o', '-',                // write to stdout (pipe to HTTP response in real-time)
+    ...extraArgs,
     '--no-playlist',
     '--socket-timeout', '60',
     '--retries', '2',
