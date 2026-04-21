@@ -262,7 +262,7 @@ async function tryCobalt(videoUrl, quality) {
   return null;
 }
 
-exports.downloadVideoGet = (req, res) => {
+exports.downloadVideoGet = async (req, res) => {
   const { url, quality = '720p', validate } = req.query;
   if (!url || typeof url !== 'string' || !url.startsWith('http')) {
     return res.status(400).json({ success: false, message: 'A valid video URL is required.' });
