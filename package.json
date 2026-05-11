@@ -50,6 +50,7 @@
     "rate-limit-redis": "^4.3.1",
     "razorpay": "^2.9.2",
     "stripe": "^16.2.0",
+    "whois": "^2.16.1",
     "winston": "^3.13.0",
     "winston-daily-rotate-file": "^5.0.0",
     "yt-dlp-exec": "^1.0.2"

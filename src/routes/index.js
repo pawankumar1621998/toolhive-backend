@@ -29,6 +29,6 @@ router.use('/tools',         require('./toolRoutes'));
 router.use('/video',         require('./videoRoutes'));
 router.use('/dashboard',     require('./dashboardRoutes'));
 router.use('/subscriptions', require('./subscriptionRoutes'));
-router.use('/whois', require('./whoisRoutes'));
+// WHOIS route removed - needs proper hosting with WHOIS package
 
 module.exports = router;
