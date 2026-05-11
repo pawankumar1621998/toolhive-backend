@@ -29,5 +29,6 @@ router.use('/tools',         require('./toolRoutes'));
 router.use('/video',         require('./videoRoutes'));
 router.use('/dashboard',     require('./dashboardRoutes'));
 router.use('/subscriptions', require('./subscriptionRoutes'));
+router.use('/whois', require('./whoisRoutes'));
 
 module.exports = router;
